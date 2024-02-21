@@ -11,8 +11,4 @@ fn main() -> std::io::Result<()> {
         stdin.read_line(&mut buffer)?;
         stream.write_all(buffer.as_bytes())?;
     }
-    // when you first connect, the server sends the file
-    // the file is created temporarily in a specified directory with configuration from the client
-    // you edit the file with your editor of choice
-    // when the connection is closed, the file is deleted
 }
