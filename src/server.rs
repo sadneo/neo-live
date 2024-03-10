@@ -2,19 +2,27 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 
 fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:62639").unwrap();
-    
-    let (mut stream, addr) = listener.accept()?;
-    println!("{:?}\n{:?}", stream, addr);
+    let ip_addr = "127.0.0.1";
+    let port = 3249;
 
-    loop {
-        let mut buffer = [0; 16];
-        stream.read_exact(&mut buffer)?;
-        println!("{:?}", buffer);
+    let listener = TcpListener::bind((ip_addr, port)).unwrap();
 
-        stream.write_all(&buffer)?;
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else {
+            continue;
+        };
 
-        let message = String::from_utf8(buffer.to_vec()).unwrap();
-        println!("{}", message);
+        loop {
+            let mut buffer = [0; 8];
+            stream.read_exact(&mut buffer)?;
+            let mut data_buffer = vec![0; usize::from_be_bytes(buffer)];
+            stream.read_exact(&mut data_buffer)?;
+
+            stream.write_all(&data_buffer)?;
+
+            let message = String::from_utf8(data_buffer.to_vec()).unwrap();
+            print!("{}", message);
+        }
     }
+    Ok(())
 }
