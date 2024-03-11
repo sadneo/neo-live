@@ -1,9 +1,26 @@
+use clap::Parser;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    /// IPv4 Address
+    #[arg(short, long)]
+    address: Option<String>,
+
+    /// Port to use
+    #[arg(short, long)]
+    port: Option<u16>,
+}
+
 fn main() -> std::io::Result<()> {
-    let ip_addr = "127.0.0.1";
-    let port = 3249;
+    let cli = Cli::parse();
+    let ip_addr = match &cli.address {
+        Some(address) => address,
+        None => "127.0.0.1",
+    };
+    let port = cli.port.unwrap_or(3249);
 
     let listener = TcpListener::bind((ip_addr, port)).unwrap();
 
