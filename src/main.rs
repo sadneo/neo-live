@@ -9,12 +9,12 @@ struct Cli {
     command: Commands,
 
     /// IPv4 Address
-    #[arg(short, long)]
-    address: Option<String>,
+    #[arg(short, long, default_value = "127.0.0.1")]
+    address: String,
 
     /// Port to use
-    #[arg(short, long)]
-    port: Option<u16>,
+    #[arg(short, long, default_value = "3249")]
+    port: u16,
 }
 
 #[derive(Subcommand, Debug)]
@@ -27,11 +27,8 @@ enum Commands {
 
 fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
-    let ip_addr = match &cli.address {
-        Some(address) => address,
-        None => "127.0.0.1",
-    };
-    let port = cli.port.unwrap_or(3249);
+    let ip_addr = &cli.address;
+    let port = cli.port;
 
     match cli.command {
         Commands::Serve => commands::serve((ip_addr, port)),
