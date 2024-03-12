@@ -25,13 +25,14 @@ enum Commands {
     Client,
 }
 
-fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
     let ip_addr = &cli.address;
     let port = cli.port;
 
     match cli.command {
-        Commands::Serve => commands::serve((ip_addr, port)),
-        Commands::Client => commands::client((ip_addr, port)),
+        Commands::Serve => commands::serve((ip_addr, port)).await,
+        Commands::Client => commands::client((ip_addr, port)).await,
     }
 }
