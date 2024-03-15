@@ -1,6 +1,5 @@
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task;
 
 pub async fn serve(sock_addr: (&str, u16)) -> std::io::Result<()> {
@@ -28,31 +27,22 @@ async fn serve_stream(mut stream: TcpStream) -> std::io::Result<()> {
 pub async fn client(sock_addr: (&str, u16)) -> std::io::Result<()> {
     let (rstream, wstream) = TcpStream::connect(sock_addr).await?.into_split();
 
-    task::spawn(client_send(wstream));
-    task::spawn(client_update(rstream));
+    task::spawn(handle_client(io::stdin(), wstream));
+    task::spawn(handle_client(rstream, io::stdout()));
     Ok(())
 }
 
-async fn client_send(mut wstream: OwnedWriteHalf) -> std::io::Result<()> {
-    let mut stdin = io::stdin();
-    loop {
-        let size = stdin.read_u64().await?;
-        let mut buffer = vec![0; size as usize];
-        stdin.read_exact(&mut buffer).await?;
-
-        wstream.write_all(&size.to_be_bytes()).await?;
-        wstream.write_all(&buffer).await?;
-    }
-}
-
-async fn client_update(mut rstream: OwnedReadHalf) -> std::io::Result<()> {
-    let mut stdout = io::stdout();
+async fn handle_client<Reader, Writer>(mut rstream: Reader, mut wstream: Writer) -> std::io::Result<()>
+where
+    Reader: AsyncReadExt + Unpin,
+    Writer: AsyncWriteExt + Unpin,
+{
     loop {
         let size = rstream.read_u64().await?;
         let mut buffer = vec![0; size as usize];
         rstream.read_exact(&mut buffer).await?;
 
-        stdout.write_all(&size.to_be_bytes()).await?;
-        stdout.write_all(&buffer).await?;
+        wstream.write_all(&size.to_be_bytes()).await?;
+        wstream.write_all(&buffer).await?;
     }
 }
