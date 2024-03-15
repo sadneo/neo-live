@@ -29,6 +29,7 @@ pub async fn client(sock_addr: (&str, u16)) -> std::io::Result<()> {
     let (rstream, wstream) = TcpStream::connect(sock_addr).await?.into_split();
 
     task::spawn(client_send(wstream));
+    task::spawn(client_update(rstream));
     Ok(())
 }
 
@@ -41,5 +42,17 @@ async fn client_send(mut wstream: OwnedWriteHalf) -> std::io::Result<()> {
 
         wstream.write_all(&size.to_be_bytes()).await?;
         wstream.write_all(&buffer).await?;
+    }
+}
+
+async fn client_update(mut rstream: OwnedReadHalf) -> std::io::Result<()> {
+    let mut stdout = io::stdout();
+    loop {
+        let size = rstream.read_u64().await?;
+        let mut buffer = vec![0; size as usize];
+        rstream.read_exact(&mut buffer).await?;
+
+        stdout.write_all(&size.to_be_bytes()).await?;
+        stdout.write_all(&buffer).await?;
     }
 }
