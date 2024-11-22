@@ -1,12 +1,17 @@
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 use clap::{Parser, Subcommand};
 
-mod commands;
+mod watchers;
 
 #[derive(Parser, Debug)]
 #[command(version, author, about)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    file: PathBuf,
 
     /// IPv4 Address
     #[arg(short, long, default_value = "127.0.0.1")]
@@ -26,13 +31,18 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() {
     let cli = Cli::parse();
-    let ip_addr = &cli.address;
-    let port = cli.port;
+    // let ip_addr = &cli.address;
+    // let port = cli.port;
 
-    match cli.command {
-        Commands::Serve => commands::serve((ip_addr, port)).await,
-        Commands::Client => commands::client((ip_addr, port)).await,
+    let path = std::path::PathBuf::from("test.txt").canonicalize().unwrap();
+    let (sx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        watchers::watch(&path, sx);
+    });
+
+    for event in rx {
+        println!("{event}");
     }
 }
