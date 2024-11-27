@@ -1,7 +1,11 @@
-use std::path::PathBuf;
-use std::sync::mpsc;
-use std::thread;
 use clap::{Parser, Subcommand};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::fs;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 mod watchers;
 
@@ -9,13 +13,15 @@ mod watchers;
 #[command(version, author, about)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
-
-    file: PathBuf,
+    command: Command,
 
     /// IPv4 Address
     #[arg(short, long, default_value = "127.0.0.1")]
     address: String,
+
+    /// Port to use
+    #[arg(short, long, default_value = "3248")]
+    write_port: u16,
 
     /// Port to use
     #[arg(short, long, default_value = "3249")]
@@ -23,26 +29,53 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
-enum Commands {
+enum Command {
     /// Serve file to a port
-    Serve,
-    /// Become client to a served port
-    Client,
+    Serve {
+        /// file to serve
+        path: PathBuf,
+    },
+    /// Connect to server at port
+    Connect {
+        /// file to write to
+        path: PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    // let ip_addr = &cli.address;
-    // let port = cli.port;
 
     let path = std::path::PathBuf::from("test.txt").canonicalize().unwrap();
-    let (sx, rx) = mpsc::channel::<String>();
+    let (file_update_sender, file_update_receiver) = mpsc::channel::<String>();
     thread::spawn(move || {
-        watchers::watch(&path, sx);
+        watchers::watch(&path, file_update_sender);
     });
 
-    for event in rx {
-        println!("{event}");
+    let addr = Ipv4Addr::from_str(&cli.address).unwrap();
+    let socket = SocketAddrV4::new(addr, cli.port);
+    let write_socket = SocketAddrV4::new(addr, cli.write_port);
+
+    match cli.command {
+        Command::Serve { path } => todo!("path: {:?}", path),
+        Command::Connect { path } => connect(path, file_update_receiver, socket, write_socket),
     }
+}
+
+fn connect(output: PathBuf, file_updates: Receiver<String>, read_socket: SocketAddrV4, write_socket: SocketAddrV4) {
+    thread::spawn(move || {
+        let mut stream = TcpStream::connect(read_socket).unwrap();
+        let mut buffer = String::new();
+        loop {
+            stream.read_to_string(&mut buffer).unwrap();
+            fs::write(&output, &buffer).unwrap();
+            buffer.clear();
+        }
+    });
+    thread::spawn(move || {
+        let mut stream = TcpStream::connect(write_socket).unwrap();
+        for update in file_updates {
+            stream.write_all(update.as_bytes()).unwrap();
+        }
+    });
 }
