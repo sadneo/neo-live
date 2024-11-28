@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::fs;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
@@ -15,17 +15,13 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// IPv4 Address
-    #[arg(short, long, default_value = "127.0.0.1")]
-    address: String,
-
     /// Port to use
     #[arg(short, long, default_value = "3248")]
-    write_port: u16,
+    server_port: u16,
 
     /// Port to use
     #[arg(short, long, default_value = "3249")]
-    port: u16,
+    client_port: u16,
 }
 
 #[derive(Subcommand, Debug)]
@@ -39,6 +35,10 @@ enum Command {
     Connect {
         /// file to write to
         path: PathBuf,
+
+        /// Remote IPv4 address to connect to
+        #[arg(short, long, default_value = "127.0.0.1")]
+        address: String,
     },
 }
 
@@ -52,17 +52,16 @@ async fn main() {
         watchers::watch(&path, file_update_sender);
     });
 
-    let addr = Ipv4Addr::from_str(&cli.address).unwrap();
-    let socket = SocketAddrV4::new(addr, cli.port);
-    let write_socket = SocketAddrV4::new(addr, cli.write_port);
-
     match cli.command {
-        Command::Serve { path } => todo!("path: {:?}", path),
-        Command::Connect { path } => connect(path, file_update_receiver, socket, write_socket),
+        Command::Serve { path } => todo!("{:?}", path),
+        Command::Connect { path, address } => connect(path, file_update_receiver, Ipv4Addr::from_str(&address).unwrap(), cli.server_port, cli.client_port),
     }
 }
 
-fn connect(output: PathBuf, file_updates: Receiver<String>, read_socket: SocketAddrV4, write_socket: SocketAddrV4) {
+fn connect(output: PathBuf, file_updates: Receiver<String>, remote: Ipv4Addr, server_port: u16, client_port: u16) {
+    let read_socket = SocketAddrV4::new(remote, client_port);
+    let write_socket = SocketAddrV4::new(remote, server_port);
+
     thread::spawn(move || {
         let mut stream = TcpStream::connect(read_socket).unwrap();
         let mut buffer = String::new();
