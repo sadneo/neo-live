@@ -1,4 +1,3 @@
-use clap::{Parser, Subcommand};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
@@ -7,7 +6,15 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
+use clap::{Parser, Subcommand, ValueEnum};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+
+#[derive(ValueEnum, Clone, Debug)]
+enum HostMode {
+    Local, // 127.0.0.1
+    Lan,   // Local IP like 192.168.x.x
+    All,   // 0.0.0.0
+}
 
 #[derive(Parser, Debug)]
 #[command(version, author, about)]
@@ -17,23 +24,24 @@ struct Cli {
 
     /// Port to use
     #[arg(short, long, default_value = "3248")]
-    server_port: u16,
-
-    /// Port to use
-    #[arg(short, long, default_value = "3249")]
-    client_port: u16,
+    port: u16,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Serve file to a port
+    /// Serve file to a socket
     Serve {
-        /// file to serve
+        /// File to serve
         path: PathBuf,
+
+        // currently defaults to HostMode::Local for debugging
+        /// Interface to bind to
+        #[arg(long, value_enum, default_value_t = HostMode::Local)]
+        host_mode: HostMode,
     },
-    /// Connect to server at port
+    /// Connect to server at socket
     Connect {
-        /// file to write to
+        /// File to write to
         path: PathBuf,
 
         /// Remote IPv4 address to connect to
@@ -47,35 +55,43 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { path } => serve(path, cli.server_port),
+        Command::Serve { path, host_mode } => serve(path, host_mode, cli.port),
         Command::Connect { path, address } => connect(
             path,
             Ipv4Addr::from_str(&address).expect("Expected address"),
-            cli.server_port,
+            cli.port,
         ),
     }
 }
 
-fn serve(file_path: PathBuf, server_port: u16) {
-    let address = "127.0.0.1".parse().unwrap();
-    let write_socket = SocketAddrV4::new(address, server_port);
-    let listener = TcpListener::bind(write_socket).expect("error when creating listener");
+fn serve(file_path: PathBuf, host_mode: HostMode, port: u16) {
+    let address = match host_mode {
+        HostMode::Local => Ipv4Addr::new(127, 0, 0, 1),
+        HostMode::All => Ipv4Addr::new(0, 0, 0, 0),
+        HostMode::Lan => local_ip_address::local_ip()
+            .unwrap()
+            .to_string()
+            .parse()
+            .unwrap(),
+    };
+    let write_socket = SocketAddrV4::new(address, port);
 
     let clients: Arc<RwLock<Vec<TcpStream>>> = Arc::new(RwLock::new(Vec::new()));
     let clients_ref = clients.clone();
     let file_path_clone = file_path.clone();
 
     thread::spawn(move || {
+        let listener = TcpListener::bind(write_socket).expect("Failed to create listener");
         for stream in listener.incoming().flatten() {
             let mut clients_guard = clients.write().unwrap();
-            println!("{:?}", stream);
             clients_guard.push(stream);
+            println!("Client added");
         }
     });
 
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher: RecommendedWatcher =
-    Watcher::new(tx, Config::default()).expect("Failed to create watcher");
+        Watcher::new(tx, Config::default()).expect("Failed to create watcher");
 
     watcher
         .watch(&file_path_clone, RecursiveMode::NonRecursive)
@@ -90,16 +106,14 @@ fn serve(file_path: PathBuf, server_port: u16) {
                 };
 
                 let mut guard = clients_ref.write().unwrap();
-                guard.retain_mut(|stream| {
-                    stream.write_all(&contents).is_ok()
-                });
+                guard.retain_mut(|stream| stream.write_all(&contents).is_ok());
             }
         }
     }
 }
 
-fn connect(output: PathBuf, remote: Ipv4Addr, server_port: u16) {
-    let read_socket = SocketAddrV4::new(remote, server_port);
+fn connect(path: PathBuf, remote: Ipv4Addr, port: u16) {
+    let read_socket = SocketAddrV4::new(remote, port);
 
     let mut stream = TcpStream::connect(read_socket).unwrap();
     let mut buffer = [0; 500];
@@ -110,6 +124,6 @@ fn connect(output: PathBuf, remote: Ipv4Addr, server_port: u16) {
         }
         let contents = String::from_utf8_lossy(&buffer[..n]);
         println!("recv: {:?}", contents);
-        fs::write(&output, &buffer).unwrap();
+        fs::write(&path, buffer).unwrap();
     }
 }
