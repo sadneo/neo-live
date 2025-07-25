@@ -1,5 +1,6 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::BufReader;
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -8,6 +9,13 @@ use std::thread;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::{Serialize, Deserialize};
+use rmp_serde::{encode, Deserializer};
+
+#[derive(Serialize, Deserialize)]
+struct TextUpdate {
+    text: String,
+}
 
 #[derive(ValueEnum, Clone, Debug)]
 enum HostMode {
@@ -97,16 +105,23 @@ fn serve(file_path: PathBuf, host_mode: HostMode, port: u16) {
         .watch(&file_path_clone, RecursiveMode::NonRecursive)
         .expect("Failed to watch file");
 
+    let mut buf = Vec::new();
     loop {
         if let Ok(event) = rx.recv() {
             if let EventKind::Modify(_) = event.unwrap().kind {
                 println!("modify");
-                let Ok(contents) = fs::read(&file_path) else {
+                let Ok(contents) = fs::read_to_string(&file_path) else {
                     continue;
                 };
+                let message = TextUpdate { text: contents };
+                if let Err(e) = encode::write(&mut buf, &message) {
+                    eprintln!("msgpack encode error: {e}");
+                    continue;
+                }
 
                 let mut guard = clients_ref.write().unwrap();
-                guard.retain_mut(|stream| stream.write_all(&contents).is_ok());
+                guard.retain_mut(|stream| stream.write_all(&buf).is_ok());
+                buf.clear();
             }
         }
     }
@@ -114,16 +129,22 @@ fn serve(file_path: PathBuf, host_mode: HostMode, port: u16) {
 
 fn connect(path: PathBuf, remote: Ipv4Addr, port: u16) {
     let read_socket = SocketAddrV4::new(remote, port);
+    let stream = TcpStream::connect(read_socket).unwrap();
+    let mut reader = BufReader::new(stream);
 
-    let mut stream = TcpStream::connect(read_socket).unwrap();
-    let mut buffer = [0; 500];
     loop {
-        let n = stream.read(&mut buffer).unwrap();
-        if n == 0 {
-            break;
+        let mut deserializer = Deserializer::new(&mut reader);
+        match TextUpdate::deserialize(&mut deserializer) {
+            Ok(message) => {
+                println!("recv: {:?}", message.text);
+                if let Err(e) = fs::write(&path, &message.text) {
+                    eprintln!("Failed to write file: {}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("Deserialization error: {}", e);
+                break;
+            }
         }
-        let contents = String::from_utf8_lossy(&buffer[..n]);
-        println!("recv: {:?}", contents);
-        fs::write(&path, buffer).unwrap();
     }
 }
