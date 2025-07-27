@@ -1,17 +1,22 @@
 use std::fs;
-use std::io::{self, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+
 use std::thread;
+use std::sync::{Arc, RwLock};
+use std::io::{Write};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+
+use tokio::net::TcpStream as TokioTcpStream;
+use tokio::io::BufReader as TokioBufReader;
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use rmp_serde::{Deserializer, encode};
+use rmp_serde::{encode};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct TextUpdate {
     text: String,
 }
@@ -59,15 +64,18 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { path, host_mode } => serve(path, host_mode, cli.port),
-        Command::Connect { address } => connect(
-            Ipv4Addr::from_str(&address).expect("Expected address"),
-            cli.port,
-        ),
+        Command::Serve { path, host_mode } => serve(path, host_mode, cli.port).await,
+        Command::Connect { address } => {
+            connect(
+                Ipv4Addr::from_str(&address).expect("Expected address"),
+                cli.port,
+            )
+            .await
+        }
     }
 }
 
-fn serve(file_path: PathBuf, host_mode: HostMode, port: u16) {
+async fn serve(file_path: PathBuf, host_mode: HostMode, port: u16) {
     let address = match host_mode {
         HostMode::Local => Ipv4Addr::new(127, 0, 0, 1),
         HostMode::All => Ipv4Addr::new(0, 0, 0, 0),
@@ -111,38 +119,47 @@ fn serve(file_path: PathBuf, host_mode: HostMode, port: u16) {
                     continue;
                 };
                 let message = TextUpdate { text: contents };
-                if let Err(e) = encode::write(&mut buf, &message) {
-                    eprintln!("msgpack encode error: {e}");
-                    continue;
-                }
+
+                let payload = match encode::to_vec(&message) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("msgpack encode error: {e}");
+                        continue;
+                    }
+                };
+
+                buf.clear();
+                let len = (payload.len() as u32).to_be_bytes();
+                buf.extend_from_slice(&len);
+                buf.extend_from_slice(&payload);
 
                 let mut guard = clients_ref.write().unwrap();
                 guard.retain_mut(|stream| stream.write_all(&buf).is_ok());
-                buf.clear();
             }
         }
     }
 }
 
-fn connect(remote: Ipv4Addr, port: u16) {
+async fn connect(remote: Ipv4Addr, port: u16) {
     let read_socket = SocketAddrV4::new(remote, port);
-    let stream = TcpStream::connect(read_socket).unwrap();
-    let mut deserializer = Deserializer::new(BufReader::new(stream));
+    let stream = TokioTcpStream::connect(read_socket).await.unwrap();
+    let mut reader = TokioBufReader::new(stream);
+    let mut stdout = io::stdout();
 
-    let mut stdout = io::stdout().lock();
-
+    let mut len_buf = [0u8; 4];
     loop {
-        match TextUpdate::deserialize(&mut deserializer) {
-            Ok(message) => {
-                let text_update = TextUpdate { text: message.text };
-                let buffer = rmp_serde::to_vec(&text_update).expect("Serialization error");
-                stdout.write_all(&buffer).expect("IO error");
-                stdout.flush().expect("IO error");
-            }
-            Err(e) => {
-                eprintln!("Deserialization error: {}", e);
-                break;
-            }
+        if reader.read_exact(&mut len_buf).await.is_err() {
+            eprintln!("Connection closed");
+            break;
         }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        eprintln!("{}", len);
+
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf).await.unwrap();
+        let message = rmp_serde::from_slice::<TextUpdate>(&buf).unwrap();
+        eprintln!("message: {:?}", message);
+        
+        stdout.write_all(&buf).await.expect("IO error");
     }
 }
