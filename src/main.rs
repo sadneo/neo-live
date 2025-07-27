@@ -1,6 +1,5 @@
 use std::fs;
-use std::io::BufReader;
-use std::io::Write;
+use std::io::{self, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -9,8 +8,8 @@ use std::thread;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::{Serialize, Deserialize};
-use rmp_serde::{encode, Deserializer};
+use rmp_serde::{Deserializer, encode};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 struct TextUpdate {
@@ -49,9 +48,6 @@ enum Command {
     },
     /// Connect to server at socket
     Connect {
-        /// File to write to
-        path: PathBuf,
-
         /// Remote IPv4 address to connect to
         #[arg(short, long, default_value = "127.0.0.1")]
         address: String,
@@ -64,8 +60,7 @@ async fn main() {
 
     match cli.command {
         Command::Serve { path, host_mode } => serve(path, host_mode, cli.port),
-        Command::Connect { path, address } => connect(
-            path,
+        Command::Connect { address } => connect(
             Ipv4Addr::from_str(&address).expect("Expected address"),
             cli.port,
         ),
@@ -93,10 +88,12 @@ fn serve(file_path: PathBuf, host_mode: HostMode, port: u16) {
         for stream in listener.incoming().flatten() {
             let mut clients_guard = clients.write().unwrap();
             clients_guard.push(stream);
-            println!("Client added");
+            eprintln!("Client added");
         }
     });
 
+    // TODO: instead of watcher, listen to stdin instead and send the the entire buffer through msgpack
+    // instead of a notify Event
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher: RecommendedWatcher =
         Watcher::new(tx, Config::default()).expect("Failed to create watcher");
@@ -109,7 +106,7 @@ fn serve(file_path: PathBuf, host_mode: HostMode, port: u16) {
     loop {
         if let Ok(event) = rx.recv() {
             if let EventKind::Modify(_) = event.unwrap().kind {
-                println!("modify");
+                eprintln!("modify");
                 let Ok(contents) = fs::read_to_string(&file_path) else {
                     continue;
                 };
@@ -127,19 +124,20 @@ fn serve(file_path: PathBuf, host_mode: HostMode, port: u16) {
     }
 }
 
-fn connect(path: PathBuf, remote: Ipv4Addr, port: u16) {
+fn connect(remote: Ipv4Addr, port: u16) {
     let read_socket = SocketAddrV4::new(remote, port);
     let stream = TcpStream::connect(read_socket).unwrap();
-    let mut reader = BufReader::new(stream);
+    let mut deserializer = Deserializer::new(BufReader::new(stream));
+
+    let mut stdout = io::stdout().lock();
 
     loop {
-        let mut deserializer = Deserializer::new(&mut reader);
         match TextUpdate::deserialize(&mut deserializer) {
             Ok(message) => {
-                println!("recv: {:?}", message.text);
-                if let Err(e) = fs::write(&path, &message.text) {
-                    eprintln!("Failed to write file: {}", e);
-                }
+                let text_update = TextUpdate { text: message.text };
+                let buffer = rmp_serde::to_vec(&text_update).expect("Serialization error");
+                stdout.write_all(&buffer).expect("IO error");
+                stdout.flush().expect("IO error");
             }
             Err(e) => {
                 eprintln!("Deserialization error: {}", e);
