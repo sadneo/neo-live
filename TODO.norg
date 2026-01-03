@@ -56,9 +56,6 @@ ipv6 stuff, then ro plugin, then crdt and rw plugin, then think about discovery 
   - For lower latency, may look into QUIC in the future
 
 * Goals
-  ~ Current:
-    right now i have watching down
-    sharing files
   ~ Editor Plugin (ro)
     editor plugins spawn the neo-live process
     communicate via stdin and stdout
