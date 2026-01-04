@@ -1,6 +1,8 @@
+use std::fs::OpenOptions;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::str::FromStr;
 use std::sync::Arc;
+
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, Sender};
@@ -54,6 +56,14 @@ struct Cli {
     /// Port to use
     #[arg(short, long, default_value = "3248")]
     port: u16,
+
+    /// Log output (stdout, file)
+    #[arg(long, default_value = "stderr")]
+    log_output: String,
+
+    /// Log level
+    #[arg(long, default_value = "debug")]
+    log_level: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -123,17 +133,17 @@ impl ClientPool {
         self.clients.write().await.push(stream);
     }
 
-    /// Writes data to all clients, removing any that error out.
+    // writes data to all clients, removing any that error out.
     async fn broadcast(&self, data: &[u8]) {
         let mut clients = self.clients.write().await;
 
-        // Retain only clients that successfully accept the write
+        // retain only clients that successfully accept the write
         let mut i = 0;
         while i < clients.len() {
             match clients[i].write_all(data).await {
                 Ok(_) => i += 1,
                 Err(_) => {
-                    // Client disconnected or error, remove them
+                    // client disconnected or error, remove them
                     let client = &clients[i];
                     info!("Client at {} disconnected", client.local_addr().unwrap());
                     clients.swap_remove(i);
@@ -143,10 +153,42 @@ impl ClientPool {
     }
 }
 
+fn init_logging(log_output: String, log_level: String) {
+    use log::LevelFilter;
+
+    let log_level = match &*log_level.to_ascii_lowercase() {
+        "error" => LevelFilter::Error,
+        "warn" => LevelFilter::Warn,
+        "info" => LevelFilter::Info,
+        "debug" => LevelFilter::Debug,
+        "trace" => LevelFilter::Trace,
+        _ => LevelFilter::Off,
+    };
+
+    let mut builder = env_logger::Builder::from_default_env();
+    let mut builder = builder.filter_level(log_level);
+
+    match &*log_output {
+        "file" => {
+            let log_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/neo-live.log")
+                .expect("Could not create log file");
+
+            builder = builder.target(env_logger::Target::Pipe(Box::new(log_file)))
+        }
+        "stderr" => (),
+        _ => return,
+    };
+
+    builder.init();
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    env_logger::init();
+    init_logging(cli.log_output, cli.log_level);
 
     match cli.command {
         Command::Serve { host_mode } => serve(host_mode, cli.port, io::stdin()).await,
@@ -216,6 +258,7 @@ where
             error!("Failed to deserialize message");
             continue;
         };
+        info!("received message: {}", message.text);
 
         let Some(framed_msg) = message.encode() else {
             error!("Failed to encode message");
@@ -261,11 +304,11 @@ mod tests {
     async fn serve_basic() {
         init_logger();
         let (mut client, server) = tokio::io::duplex(64);
-        tokio::task::spawn(serve(HostMode::Local, 12345, server));
+        tokio::task::spawn(serve(HostMode::Local, 32480, server));
 
         // we use the wait statements for the network io
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let mut conn = TcpStream::connect("127.0.0.1:12345").await.unwrap();
+        let mut conn = TcpStream::connect("127.0.0.1:32480").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let orig_decoded = TextUpdate {
@@ -286,7 +329,7 @@ mod tests {
     async fn serve_broadcast() {
         init_logger();
         let (mut client, server) = tokio::io::duplex(64);
-        tokio::task::spawn(serve(HostMode::Local, 12347, server));
+        tokio::task::spawn(serve(HostMode::Local, 32481, server));
 
         // connect a bunch of streams to test broadcast
         const STREAM_COUNT: usize = 50;
@@ -294,7 +337,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         for _ in 0..STREAM_COUNT {
-            let conn = TcpStream::connect("127.0.0.1:12347").await.unwrap();
+            let conn = TcpStream::connect("127.0.0.1:32481").await.unwrap();
             connections.push(conn);
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -320,12 +363,12 @@ mod tests {
     async fn serve_drop() {
         init_logger();
         let (mut client, server) = tokio::io::duplex(64);
-        tokio::task::spawn(serve(HostMode::Local, 12347, server));
+        tokio::task::spawn(serve(HostMode::Local, 32482, server));
 
         // connections
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let conn1 = TcpStream::connect("127.0.0.1:12347").await.unwrap();
-        let mut conn2 = TcpStream::connect("127.0.0.1:12347").await.unwrap();
+        let conn1 = TcpStream::connect("127.0.0.1:32482").await.unwrap();
+        let mut conn2 = TcpStream::connect("127.0.0.1:32482").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         conn1
@@ -362,11 +405,11 @@ mod tests {
     async fn serve_fragment() {
         init_logger();
         let (mut client, server) = tokio::io::duplex(64);
-        tokio::task::spawn(serve(HostMode::Local, 12348, server));
+        tokio::task::spawn(serve(HostMode::Local, 32483, server));
 
         // we use the wait statements for the network io
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let mut conn = TcpStream::connect("127.0.0.1:12348").await.unwrap();
+        let mut conn = TcpStream::connect("127.0.0.1:32483").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let orig_decoded = TextUpdate {
@@ -390,11 +433,11 @@ mod tests {
     async fn serve_garbage() {
         init_logger();
         let (mut client, server) = tokio::io::duplex(64);
-        tokio::task::spawn(serve(HostMode::Local, 12341, server));
+        tokio::task::spawn(serve(HostMode::Local, 32484, server));
 
         // we use the wait statements for the network io
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let mut conn = TcpStream::connect("127.0.0.1:12341").await.unwrap();
+        let mut conn = TcpStream::connect("127.0.0.1:32484").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // don't be alarmed if you see an error here about deserialization, that's what we want to see
