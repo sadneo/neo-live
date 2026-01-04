@@ -57,12 +57,12 @@ struct Cli {
     #[arg(short, long, default_value = "3248")]
     port: u16,
 
-    /// Log output (stdout, file)
+    /// Log output (stderr, file)
     #[arg(long, default_value = "stderr")]
     log_output: String,
 
     /// Log level
-    #[arg(long, default_value = "debug")]
+    #[arg(long, default_value = "trace")]
     log_level: String,
 }
 

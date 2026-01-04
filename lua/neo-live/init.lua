@@ -51,6 +51,8 @@ function M.start_server()
     local cmd = {
         M.config.binary_path,
         "--port", tostring(M.config.port),
+        "--log-output", "file",
+        "--log-level", "trace",
         "serve"
     }
 
