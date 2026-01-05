@@ -190,5 +190,6 @@ pub async fn connect(remote: Ipv4Addr, port: u16) {
 
         let framed_msg = message.encode().unwrap();
         stdout.write_all(&framed_msg).await.expect("IO error");
+        stdout.flush().await.expect("Failed to flush");
     }
 }
