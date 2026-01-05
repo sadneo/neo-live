@@ -1,3 +1,8 @@
+local logger = require("neo-live.log")
+
+logger.log("Connected to server")
+logger.log({ port = 3248, status = "ok" }, "DEBUG")
+
 local M = {}
 
 M.config = {
@@ -83,7 +88,95 @@ function M.start_server()
     send_buffer_update(M.server_proc)
 end
 
-function M.stop_server()
+-- Helper to decode 4-byte Big Endian Unsigned Integer
+local function decode_u32(str)
+    local b1, b2, b3, b4 = string.byte(str, 1, 4)
+    return bit.bor(
+        bit.lshift(b1, 24),
+        bit.lshift(b2, 16),
+        bit.lshift(b3, 8),
+        b4
+    )
+end
+
+function M.start_client()
+    if M.client_proc then
+        vim.notify("NeoLive Client is already connected!", vim.log.levels.WARN)
+        return
+    end
+
+    local cmd = {
+        M.config.binary_path,
+        "--port", tostring(M.config.port),
+        "connect",
+        "--address", M.config.address,
+    }
+
+    -- 1. Persistent buffer to hold partial chunks across callbacks
+    M.client_proc = vim.system(cmd, {
+        stdin = true,
+        stdout = function(_, data)
+            if not data then return end
+
+            -- 2. Append new chunk to our persistent buffer
+            -- vim.schedule(function()
+            --     vim.api.nvim_buf_set_lines(0, -1, -1, false, { type(data), tostring(data) })
+            -- end)
+
+            local len = decode_u32(data)
+            logger.log("len: " .. tostring(len))
+
+            -- 4. Extract the payload
+            -- Lua string indices are 1-based.
+            -- Header is 1..4, Payload is 5..(4+len)
+            local payload_str = string.sub(data, 5, 4 + len)
+
+            -- 5. Decode MsgPack
+            local success, decoded = pcall(vim.mpack.decode, payload_str)
+            logger.log("text: " .. vim.inspect(decoded))
+
+            if success then
+                vim.schedule(function()
+                    if decoded.text then
+                        logger.log("Updating buffer with text length: " .. #decoded.text, "DEBUG")
+                        local lines = vim.split(decoded.text, "\n")
+                        vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+                    end
+                end)
+            else
+                -- If decoding fails, we likely have protocol garbage.
+                -- In a real app, you might want to reset the buffer or log error.
+                vim.schedule(function() logger.log("MsgPack decode failed", "ERROR") end)
+            end
+        end,
+        --[[ debug
+        stderr = function(err, data)
+            vim.schedule(function()
+                local lines = vim.split(data, "\n")
+                vim.api.nvim_buf_set_lines(0, -1, -1, false, {"stderr"})
+                vim.api.nvim_buf_set_lines(0, -1, -1, false, lines)
+            end)
+        end,
+        ]]
+        text = false, -- CRITICAL: Ensures we get raw bytes, not text lines
+    }, function(obj)
+        M.client_proc = nil
+        vim.schedule(function()
+            local level = obj.code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
+            vim.notify("NeoLive Client disconnected. Code: " .. obj.code, level)
+        end)
+    end)
+
+    print("NeoLive Client connecting to " .. M.config.address .. ":" .. M.config.port)
+end
+
+-- stop all processes
+function M.stop()
+    if M.client_proc then
+        M.server_proc:kill(9)
+        M.server_proc = nil
+    end
+
     if M.server_proc then
         M.server_proc:kill(9)
         M.server_proc = nil
