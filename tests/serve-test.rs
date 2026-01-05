@@ -4,13 +4,11 @@ use tokio::net::TcpStream;
 
 use log::info;
 
-use neo_live::TextUpdate;
 use neo_live::serve;
+use neo_live::TextUpdate;
 
 fn init_logger() {
-    let _ = env_logger::builder()
-        .is_test(true)
-        .try_init();
+    let _ = env_logger::builder().is_test(true).try_init();
 }
 
 #[tokio::test]
