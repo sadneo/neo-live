@@ -3,7 +3,6 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use tokio::io;
 
 #[derive(Parser, Debug)]
 #[command(version, author, about)]
@@ -101,7 +100,7 @@ async fn main() {
     match cli.command {
         Command::Serve { host_mode } => {
             let addr = resolve_address(host_mode, cli.port);
-            neo_live::serve(addr, io::stdin()).await
+            neo_live::serve(addr).await
         }
         Command::Connect { address } => {
             neo_live::connect(

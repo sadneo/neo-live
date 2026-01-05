@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::RwLock;
 use tokio::task;
@@ -81,7 +82,7 @@ impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
 
 #[derive(Clone)]
 struct ClientPool {
-    clients: Arc<RwLock<Vec<TcpStream>>>,
+    clients: Arc<RwLock<Vec<OwnedWriteHalf>>>,
 }
 
 impl ClientPool {
@@ -91,7 +92,7 @@ impl ClientPool {
         }
     }
 
-    async fn add(&self, stream: TcpStream, addr: SocketAddr) {
+    async fn add(&self, stream: OwnedWriteHalf, addr: SocketAddr) {
         info!("Client added at {}", addr);
         self.clients.write().await.push(stream);
     }
@@ -116,14 +117,24 @@ impl ClientPool {
     }
 }
 
-async fn run_listener(addr: SocketAddrV4, pool: ClientPool) {
+async fn run_listener(addr: SocketAddrV4, pool: ClientPool, tx: Sender<Vec<u8>>) {
     let listener = TcpListener::bind(addr)
         .await
         .expect("Failed to bind listener");
 
     loop {
+        let tx_ref = tx.clone();
         match listener.accept().await {
-            Ok((stream, address)) => pool.add(stream, address).await,
+            Ok((stream, address)) => {
+                let (read_half, write_half) = stream.into_split();
+
+                pool.add(write_half, address).await;
+
+                tokio::task::spawn(async move {
+                    let reader = FrameReader::new(read_half);
+                    reader.read_loop(tx_ref).await
+                });
+            },
             Err(e) => {
                 error!("Listener error: {:?}", e);
                 break;
@@ -132,26 +143,19 @@ async fn run_listener(addr: SocketAddrV4, pool: ClientPool) {
     }
 }
 
-pub async fn serve<R>(addr: SocketAddrV4, input_source: R)
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
+pub async fn serve(addr: SocketAddrV4) {
     let pool = ClientPool::new();
 
     // listen for connections
+    // also set up input reading from clients here
     let pool_ref = pool.clone();
+    let (tx, mut rx) = mpsc::channel(CHANNEL_SIZE);
+
     tokio::task::spawn(async move {
         debug!("starting listener with address {}", addr);
-        run_listener(addr, pool_ref).await;
+        run_listener(addr, pool_ref, tx).await;
     });
-    debug!("created listeners");
-
-    // separate input reading and broadcast loop
-    let (tx, mut rx) = mpsc::channel(CHANNEL_SIZE);
-    tokio::task::spawn(async move {
-        let reader = FrameReader::new(input_source);
-        reader.read_loop(tx).await
-    });
+    trace!("created listeners");
 
     while let Some(msg_bytes) = rx.recv().await {
         let Ok(message) = rmp_serde::from_slice::<TextUpdate>(&msg_bytes) else {
