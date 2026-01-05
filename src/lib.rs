@@ -28,7 +28,7 @@ impl TextUpdate {
 
     pub fn encode(&self) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
-        let payload = match rmp_serde::to_vec(&self) {
+        let payload = match rmp_serde::to_vec_named(&self) {
             Ok(p) => p,
             Err(e) => {
                 error!("msgpack encode error: {e}");
