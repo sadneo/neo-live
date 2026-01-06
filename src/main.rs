@@ -103,10 +103,10 @@ async fn main() {
             neo_live::serve(addr).await
         }
         Command::Connect { address } => {
-            neo_live::connect(
+            neo_live::connect(SocketAddrV4::new(
                 Ipv4Addr::from_str(&address).expect("Expected address"),
                 cli.port,
-            )
+            ))
             .await
         }
     }

@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -233,21 +233,27 @@ pub async fn serve(addr: SocketAddrV4) {
     error!("done with err {:?}", rx.recv().await);
 }
 
-// client
+// client takes the updated contents from the buffer and sends them to relay
+// later will calculate CRDT operations and send them
+// later will group edits together to save compute
 //
 // TcpStream to server to read and write buffer updates
 // stdout to write updated contents to plugin
 // stdin to read changes from plugin
-pub async fn connect(remote: Ipv4Addr, port: u16) {
-    let read_socket = SocketAddrV4::new(remote, port);
+pub async fn connect(read_socket: SocketAddrV4) {
+    run_client(read_socket, io::stdin(), io::stdout()).await;
+}
 
+pub async fn run_client<R, W>(read_socket: SocketAddrV4, input: R, mut output: W)
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     // define reader for stream, stdin, stdout
     let (read_half, mut write_half) = TcpStream::connect(read_socket)
         .await
         .expect("Failed to connect to remote")
         .into_split();
-    let mut stdout = io::stdout();
-    let stdin = io::stdin();
 
     // read from stream for broadcasted updates
     let (stream_tx, mut stream_rx) = mpsc::channel(CHANNEL_SIZE);
@@ -257,7 +263,7 @@ pub async fn connect(remote: Ipv4Addr, port: u16) {
 
     // write stdin updates to stream
     let (stdin_tx, mut stdin_rx) = mpsc::channel(CHANNEL_SIZE);
-    let stdin_reader = FrameReader::new(stdin);
+    let stdin_reader = FrameReader::new(input);
     task::spawn(async move { stdin_reader.read_loop(stdin_tx).await });
     trace!("Spawned stream read loop");
 
@@ -271,8 +277,8 @@ pub async fn connect(remote: Ipv4Addr, port: u16) {
                     Some(msg_bytes) => {
                         let message: TextUpdate = rmp_serde::from_slice(&msg_bytes).unwrap();
                         let framed = message.encode().unwrap();
-                        stdout.write_all(&framed).await.unwrap();
-                        stdout.flush().await.unwrap();
+                        output.write_all(&framed).await.unwrap();
+                        output.flush().await.unwrap();
                     }
                     None => {
                         error!("Server disconnected");
