@@ -2,8 +2,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::RwLock;
 use tokio::task;
@@ -12,6 +12,12 @@ use log::{debug, error, info, trace};
 use serde::{Deserialize, Serialize};
 
 const CHANNEL_SIZE: usize = 5;
+
+#[derive(Debug)]
+struct IncomingMessage {
+    from: SocketAddrV4,
+    content: Vec<u8>,
+}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct TextUpdate {
@@ -46,16 +52,16 @@ impl TextUpdate {
     }
 }
 
-struct FrameReader<T> {
+pub struct FrameReader<T> {
     reader: BufReader<T>,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
-    fn new(reader: R) -> FrameReader<R> {
+    pub fn new(reader: R) -> FrameReader<R> {
         let reader = BufReader::new(reader);
         Self { reader }
     }
-    async fn read_loop(mut self, sender: Sender<Vec<u8>>) {
+    pub async fn read_loop(mut self, sender: Sender<Vec<u8>>) {
         trace!("FrameReader read loop started");
         let mut len_buf = [0u8; 4];
         loop {
@@ -78,6 +84,24 @@ impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
         }
         error!("Read loop broke")
     }
+    pub async fn next_frame(&mut self) -> Option<Vec<u8>> {
+        let mut len_buf = [0u8; 4];
+        trace!("stream waiting on reading data...");
+        if self.reader.read_exact(&mut len_buf).await.is_err() {
+            error!("Connection closed");
+            return None;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        trace!("FrameReader unpacked {} bytes", len);
+
+        let mut buf = vec![0u8; len];
+        if self.reader.read_exact(&mut buf).await.is_err() {
+            error!("Connection closed");
+            return None;
+        }
+
+        Some(buf)
+    }
 }
 
 #[derive(Clone)]
@@ -92,32 +116,47 @@ impl ClientPool {
         }
     }
 
-    async fn add(&self, stream: OwnedWriteHalf, addr: SocketAddr) {
+    async fn add(&self, stream: OwnedWriteHalf, addr: &SocketAddrV4) {
         info!("Client added at {}", addr);
         self.clients.write().await.push(stream);
     }
 
     // writes data to all clients, removing any that error out.
-    async fn broadcast(&self, data: &[u8]) {
+    async fn broadcast(&self, data: &[u8], ignore: &SocketAddrV4) {
         let mut clients = self.clients.write().await;
 
         // retain only clients that successfully accept the write
         let mut i = 0;
+        trace!("Broadcasting update now");
         while i < clients.len() {
+            let client = &clients[i];
+            trace!(
+                "Handling client {} {}",
+                client.peer_addr().unwrap(),
+                client.local_addr().unwrap()
+            );
+            if let Ok(SocketAddr::V4(addr)) = client.peer_addr() {
+                if &addr == ignore {
+                    trace!("Skipping {}", addr);
+                    i += 1;
+                    continue;
+                }
+            }
+
             match clients[i].write_all(data).await {
                 Ok(_) => i += 1,
                 Err(_) => {
                     // client disconnected or error, remove them
-                    let client = &clients[i];
-                    info!("Client at {} disconnected", client.local_addr().unwrap());
+                    info!("Client at {} disconnected", clients[i].peer_addr().unwrap());
                     clients.swap_remove(i);
                 }
             }
+            clients[i].flush().await.unwrap();
         }
     }
 }
 
-async fn run_listener(addr: SocketAddrV4, pool: ClientPool, tx: Sender<Vec<u8>>) {
+async fn run_listener(addr: SocketAddrV4, pool: ClientPool, tx: Sender<IncomingMessage>) {
     let listener = TcpListener::bind(addr)
         .await
         .expect("Failed to bind listener");
@@ -125,16 +164,30 @@ async fn run_listener(addr: SocketAddrV4, pool: ClientPool, tx: Sender<Vec<u8>>)
     loop {
         let tx_ref = tx.clone();
         match listener.accept().await {
-            Ok((stream, address)) => {
+            Ok((stream, SocketAddr::V4(address))) => {
+                info!("{} connected to server", address);
                 let (read_half, write_half) = stream.into_split();
 
-                pool.add(write_half, address).await;
+                // add the stream to the pool for broadcasting
+                pool.add(write_half, &address).await;
 
-                tokio::task::spawn(async move {
-                    let reader = FrameReader::new(read_half);
-                    reader.read_loop(tx_ref).await
+                // when the stream sends messages, add "from" address so when it gets broadcasted
+                // it doesn't get sent back to the same guy
+                let mut reader = FrameReader::new(read_half);
+                tokio::spawn(async move {
+                    while let Some(msg) = reader.next_frame().await {
+                        trace!("Transmitting message");
+                        let msg = IncomingMessage {
+                            from: address,
+                            content: msg,
+                        };
+                        tx_ref.send(msg).await.unwrap();
+                    }
                 });
-            },
+            }
+            Ok((_, SocketAddr::V6(addr))) => {
+                error!("i don't wanna think about ipv6 yet {}", addr)
+            }
             Err(e) => {
                 error!("Listener error: {:?}", e);
                 break;
@@ -143,6 +196,12 @@ async fn run_listener(addr: SocketAddrV4, pool: ClientPool, tx: Sender<Vec<u8>>)
     }
 }
 
+// server acts as a relay to send buffer contents
+// later will relay CRDT operations instead
+// later check whether the messages are valid so it doesn't relay junk
+//
+// uses TcpListener to add streams to ClientPool
+// both reads and writes to streams
 pub async fn serve(addr: SocketAddrV4) {
     let pool = ClientPool::new();
 
@@ -157,8 +216,8 @@ pub async fn serve(addr: SocketAddrV4) {
     });
     trace!("created listeners");
 
-    while let Some(msg_bytes) = rx.recv().await {
-        let Ok(message) = rmp_serde::from_slice::<TextUpdate>(&msg_bytes) else {
+    while let Some(msg) = rx.recv().await {
+        let Ok(message) = rmp_serde::from_slice::<TextUpdate>(&msg.content) else {
             error!("Failed to deserialize message");
             continue;
         };
@@ -169,31 +228,74 @@ pub async fn serve(addr: SocketAddrV4) {
             continue;
         };
 
-        pool.broadcast(&framed_msg).await;
+        pool.broadcast(&framed_msg, &msg.from).await;
     }
     error!("done with err {:?}", rx.recv().await);
 }
 
+// client
+//
+// TcpStream to server to read and write buffer updates
+// stdout to write updated contents to plugin
+// stdin to read changes from plugin
 pub async fn connect(remote: Ipv4Addr, port: u16) {
     let read_socket = SocketAddrV4::new(remote, port);
-    let stream = TcpStream::connect(read_socket).await.unwrap();
-    let reader = FrameReader::new(stream);
+
+    // define reader for stream, stdin, stdout
+    let (read_half, mut write_half) = TcpStream::connect(read_socket)
+        .await
+        .expect("Failed to connect to remote")
+        .into_split();
     let mut stdout = io::stdout();
-    let (tx, mut rx) = mpsc::channel(CHANNEL_SIZE);
+    let stdin = io::stdin();
 
-    trace!("Spawned read loop");
-    task::spawn(async move { reader.read_loop(tx).await });
+    // read from stream for broadcasted updates
+    let (stream_tx, mut stream_rx) = mpsc::channel(CHANNEL_SIZE);
+    let stream_reader = FrameReader::new(read_half);
+    task::spawn(async move { stream_reader.read_loop(stream_tx).await });
+    trace!("Spawned stream read loop");
 
+    // write stdin updates to stream
+    let (stdin_tx, mut stdin_rx) = mpsc::channel(CHANNEL_SIZE);
+    let stdin_reader = FrameReader::new(stdin);
+    task::spawn(async move { stdin_reader.read_loop(stdin_tx).await });
+    trace!("Spawned stream read loop");
+
+    // write broadcasted updates to stdout
     loop {
-        let Some(msg_bytes) = rx.recv().await else {
-            error!("Something went wrong");
-            break;
-        };
-        let message: TextUpdate = rmp_serde::from_slice(&msg_bytes).unwrap();
-        info!("message: {:?}", message);
+        // use select here
+        tokio::select! {
+            // server -> stdout
+            val = stream_rx.recv() => {
+                match val {
+                    Some(msg_bytes) => {
+                        let message: TextUpdate = rmp_serde::from_slice(&msg_bytes).unwrap();
+                        let framed = message.encode().unwrap();
+                        stdout.write_all(&framed).await.unwrap();
+                        stdout.flush().await.unwrap();
+                    }
+                    None => {
+                        error!("Server disconnected");
+                        break;
+                    }
+                }
+            }
 
-        let framed_msg = message.encode().unwrap();
-        stdout.write_all(&framed_msg).await.expect("IO error");
-        stdout.flush().await.expect("Failed to flush");
+            // stdin -> server
+            val = stdin_rx.recv() => {
+                match val {
+                    Some(msg_bytes) => {
+                        let message: TextUpdate = rmp_serde::from_slice(&msg_bytes).unwrap();
+                        let framed = message.encode().unwrap();
+                        write_half.write_all(&framed).await.unwrap();
+                        write_half.flush().await.unwrap();
+                    }
+                    None => {
+                        error!("Stdin closed");
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
