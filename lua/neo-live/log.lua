@@ -5,6 +5,15 @@ local M = {}
 -- Mac: ~/Library/Application Support/nvim/neo-live.log
 local path = vim.fn.stdpath("state") .. "/neo-live.log"
 
+-- log inner process's stderr distinctly
+function M.inner(msg)
+    local f = io.open(path, "a") -- "a" for append
+    if f then
+        f:write(string.format("[client] %s", msg))
+        f:close()
+    end
+end
+
 function M.log(msg, level)
     local f = io.open(path, "a") -- "a" for append
     if f then
@@ -15,7 +24,7 @@ function M.log(msg, level)
             msg = vim.inspect(msg)
         end
 
-        local str = string.format("[%s] [%s] %s\n", timestamp, level or "INFO", msg)
+        local str = string.format("[plugin] [%s] [%s] %s\n", timestamp, level or "INFO", msg)
         f:write(str)
         f:close()
     end
