@@ -127,15 +127,17 @@ impl ClientPool {
 
         // retain only clients that successfully accept the write
         let mut i = 0;
-        trace!("Broadcasting update now");
+        trace!("Broadcasting update");
         while i < clients.len() {
             let client = &clients[i];
-            trace!(
-                "Handling client {} {}",
-                client.peer_addr().unwrap(),
-                client.local_addr().unwrap()
-            );
+            let addr_string = client
+                .peer_addr()
+                .map(|s| format!("{}", s))
+                .unwrap_or("<bad peer_addr>".to_owned());
+
+            trace!("Handling client {}", addr_string);
             if let Ok(SocketAddr::V4(addr)) = client.peer_addr() {
+                trace!("Judging whether to skip addr {}, ignore {}", addr, ignore);
                 if &addr == ignore {
                     trace!("Skipping {}", addr);
                     i += 1;
@@ -144,14 +146,22 @@ impl ClientPool {
             }
 
             match clients[i].write_all(data).await {
-                Ok(_) => i += 1,
+                Ok(_) => {
+                    trace!("Broadcasted to client with peer_addr {}", addr_string,);
+                    i += 1;
+                }
                 Err(_) => {
                     // client disconnected or error, remove them
-                    info!("Client at {} disconnected", clients[i].peer_addr().unwrap());
+                    info!("Client at {} disconnected", addr_string);
                     clients.swap_remove(i);
                 }
             }
-            clients[i].flush().await.unwrap();
+            // clients[i].flush().await.unwrap();
+        }
+        trace!("Broadcast done");
+
+        for client in &mut *clients {
+            client.flush().await.unwrap();
         }
     }
 }
@@ -276,6 +286,7 @@ where
                 match val {
                     Some(msg_bytes) => {
                         let message: TextUpdate = rmp_serde::from_slice(&msg_bytes).unwrap();
+                        trace!("server -> stdout {:?}", message);
                         let framed = message.encode().unwrap();
                         output.write_all(&framed).await.unwrap();
                         output.flush().await.unwrap();
@@ -291,7 +302,10 @@ where
             val = stdin_rx.recv() => {
                 match val {
                     Some(msg_bytes) => {
+                        // deserialize and serialize for later
+                        // also ensures that plugin isn't sending garbage to the server
                         let message: TextUpdate = rmp_serde::from_slice(&msg_bytes).unwrap();
+                        trace!("stdin -> server {:?}", message);
                         let framed = message.encode().unwrap();
                         write_half.write_all(&framed).await.unwrap();
                         write_half.flush().await.unwrap();
