@@ -4,7 +4,7 @@ local M = {}
 M.config = {
     address = "127.0.0.1",
     port = "3248",
-    binary_path = vim.fn.getcwd() .. "/target/debug/neo-live",
+    binary_path = vim.fn.getcwd() .. "/target/debug/neo-live", -- TMP
 }
 
 M._client_job = nil
@@ -56,60 +56,65 @@ function M.connect()
 
     log.log("Connecting to " .. M.config.address .. ":" .. M.config.port)
 
-    -- 1. Attach to Buffer Changes
+    -- listen for buffer changes
     vim.api.nvim_buf_attach(0, false, {
         on_lines = function()
-            -- don't register changes if it's from neo-live
-            if M._is_applying_remote then return end
+            if M._is_applying_remote or not M._client_job then return end
 
-            -- CHECK: Ensure we have a running client job
-            if M._client_job then
-                local text = get_buffer_text()
-                log.log("Sending buffer text " .. text, "TRACE")
-                local payload = vim.mpack.encode({ text = text })
+            local text = get_buffer_text()
+            log.log("Sending buffer text " .. text, "TRACE")
+            local payload = vim.mpack.encode({ text = text })
 
-                local length = encode_length(#payload)
-                M._client_job:write(length .. payload)
-            end
+            local length = encode_length(#payload)
+            M._client_job:write(length .. payload)
         end
     })
 
-    -- 2. Spawn Client with IO Callbacks
     local buffer = ""
+    local function onClientUpdate(err, data)
+        vim.schedule(function()
+            if err then
+                print("STDOUT ERROR: "..err)
+            end
+        end)
 
+        if not data then return end
+        buffer = buffer .. data;
+        log.log(string.format("received data of len %d, buffer len %d", #data, #buffer), "TRACE")
+
+        while #buffer >= 4 do
+            local length = decode_length(buffer)
+            if #buffer < 4 + length then return end
+
+            log.log("decoding", "TRACE")
+            -- decode it, seems valid
+            local raw_payload = string.sub(buffer, 5, 4 + length)
+            buffer = string.sub(buffer, length + 5)
+
+            local ok, decoded = pcall(vim.mpack.decode, raw_payload)
+
+            log.log(string.format("decoded: %s, ok: %s", vim.inspect(decoded), tostring(ok)), "TRACE")
+            if ok and decoded and type(decoded) == "table" and decoded.text then
+                local lines = vim.split(decoded.text, "\n")
+                vim.schedule(function()
+                    -- WARN: edits that happen between here will fall through the cracks,
+                    -- might need a better solution
+                    M._is_applying_remote = true
+                    vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+                    M._is_applying_remote = false
+                end)
+            else
+                log.log("failed to decode", "ERROR")
+            end
+        end
+    end
+
+    -- spawn neo-live client and listen for updates
     M._client_job = vim.system(
         { bin, "--port", M.config.port, "connect", "--address", M.config.address },
         {
             stdin = true,
-            stdout = function(_, data)
-                if not data then return end
-                buffer = buffer .. data;
-                log.log(string.format("received data of len %d, buffer len %d", #data, #buffer), "TRACE")
-
-                while #buffer >= 4 do
-                    local length = decode_length(buffer)
-                    if #buffer < 4 + length then return end
-
-                    log.log("decoding", "TRACE")
-                    -- decode it, seems valid
-                    local raw_payload = string.sub(buffer, 5, 4 + length)
-                    buffer = string.sub(buffer, length + 5)
-
-                    local ok, decoded = pcall(vim.mpack.decode, raw_payload)
-
-                    log.log(string.format("decoded: %s, ok: %s", vim.inspect(decoded), tostring(ok)), "TRACE")
-                    if ok and decoded and type(decoded) == "table" and decoded.text then
-                        local lines = vim.split(decoded.text, "\n")
-                        vim.schedule(function()
-                            M._is_applying_remote = true
-                            vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
-                            M._is_applying_remote = false
-                        end)
-                    else
-                        log.log("failed to decode", "ERROR")
-                    end
-                end
-            end,
+            stdout = onClientUpdate,
             stderr = function(_, data)
                 if data then log.inner(data) end
             end,
