@@ -62,8 +62,16 @@ function M.connect()
             if M._is_applying_remote or not M._client_job then return end
 
             local text = get_buffer_text()
+            local cursor = vim.api.nvim_win_get_cursor(0)
+            local buffer = vim.api.nvim_buf_get_name(0)
             log.log("Sending buffer text " .. text, "TRACE")
-            local payload = vim.mpack.encode({ text = text })
+
+            local payload = vim.mpack.encode({
+                cursor_row = cursor[1],
+                cursor_col = cursor[2],
+                buffer = vim.fn.fnamemodify(buffer, ":."),
+                text = text,
+            })
 
             local length = encode_length(#payload)
             M._client_job:write(length .. payload)

@@ -32,23 +32,41 @@ impl TextUpdate {
     pub fn text(&self) -> &String {
         &self.text
     }
+}
 
-    pub fn encode(&self) -> Option<Vec<u8>> {
-        let mut buf = Vec::new();
-        let payload = match rmp_serde::to_vec_named(&self) {
-            Ok(p) => p,
-            Err(e) => {
-                error!("msgpack encode error: {e}");
-                return None;
-            }
-        };
+fn encode_frame(obj: &impl Serialize) -> Option<Vec<u8>> {
+    let payload = match rmp_serde::to_vec_named(obj) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("msgpack encode error: {e}");
+            return None;
+        }
+    };
 
-        buf.clear();
-        let len = (payload.len() as u32).to_be_bytes();
-        buf.extend_from_slice(&len);
-        buf.extend_from_slice(&payload);
+    let mut buf = Vec::with_capacity(4 + payload.len());
+    let len = (payload.len() as u32).to_be_bytes();
+    buf.extend_from_slice(&len);
+    buf.extend_from_slice(&payload);
 
-        Some(buf)
+    Some(buf)
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct PluginUpdate {
+    cursor_row: u32,
+    cursor_col: u32,
+    buffer: String,
+    text: String,
+}
+
+impl PluginUpdate {
+    pub fn from_text(text: String) -> Self {
+        PluginUpdate {
+            cursor_row: 0,
+            cursor_col: 0,
+            buffer: "".to_owned(),
+            text,
+        }
     }
 }
 
@@ -233,7 +251,7 @@ pub async fn serve(addr: SocketAddrV4) {
         };
         info!("received message: {}", message.text);
 
-        let Some(framed_msg) = message.encode() else {
+        let Some(framed_msg) = encode_frame(&message) else {
             error!("Failed to encode message");
             continue;
         };
@@ -285,9 +303,11 @@ where
             val = stream_rx.recv() => {
                 match val {
                     Some(msg_bytes) => {
-                        let message: TextUpdate = rmp_serde::from_slice(&msg_bytes).unwrap();
-                        trace!("server -> stdout {:?}", message);
-                        let framed = message.encode().unwrap();
+                        let text_update: TextUpdate = rmp_serde::from_slice(&msg_bytes).unwrap();
+                        let plugin_update = PluginUpdate::from_text(text_update.text);
+
+                        trace!("server -> stdout {:?}", plugin_update);
+                        let framed = encode_frame(&plugin_update).unwrap();
                         output.write_all(&framed).await.unwrap();
                         output.flush().await.unwrap();
                     }
@@ -302,11 +322,11 @@ where
             val = stdin_rx.recv() => {
                 match val {
                     Some(msg_bytes) => {
-                        // deserialize and serialize for later
-                        // also ensures that plugin isn't sending garbage to the server
-                        let message: TextUpdate = rmp_serde::from_slice(&msg_bytes).unwrap();
-                        trace!("stdin -> server {:?}", message);
-                        let framed = message.encode().unwrap();
+                        let plugin_update: PluginUpdate = rmp_serde::from_slice(&msg_bytes).unwrap();
+                        let text_update: TextUpdate = TextUpdate::new(plugin_update.text);
+
+                        trace!("stdin -> server {:?}", text_update);
+                        let framed = encode_frame(&text_update).unwrap();
                         write_half.write_all(&framed).await.unwrap();
                         write_half.flush().await.unwrap();
                     }
