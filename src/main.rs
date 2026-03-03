@@ -3,6 +3,8 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use env_logger::Target;
+use log::LevelFilter;
 
 #[derive(Parser, Debug)]
 #[command(version, author, about)]
@@ -21,6 +23,10 @@ struct Cli {
     /// Log level
     #[arg(long, default_value = "trace")]
     log_level: String,
+
+    /// Filter directives in the form of the RUST_LOG environment variable
+    #[arg(long)]
+    log_filters: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -60,9 +66,7 @@ fn resolve_address(host_mode: HostMode, port: u16) -> SocketAddrV4 {
     SocketAddrV4::new(address, port)
 }
 
-fn init_logging(log_output: String, log_level: String) {
-    use log::LevelFilter;
-
+fn init_logging(log_output: String, log_level: String, log_filters: String) {
     let log_level = match &*log_level.to_ascii_lowercase() {
         "error" => LevelFilter::Error,
         "warn" => LevelFilter::Warn,
@@ -71,11 +75,7 @@ fn init_logging(log_output: String, log_level: String) {
         "trace" => LevelFilter::Trace,
         _ => LevelFilter::Off,
     };
-
-    let mut builder = env_logger::Builder::from_default_env();
-    let mut builder = builder.filter_level(log_level);
-
-    match &*log_output {
+    let log_output = match &*log_output {
         "file" => {
             let log_file = OpenOptions::new()
                 .create(true)
@@ -83,11 +83,17 @@ fn init_logging(log_output: String, log_level: String) {
                 .open("/tmp/neo-live.log")
                 .expect("Could not create log file");
 
-            builder = builder.target(env_logger::Target::Pipe(Box::new(log_file)))
+            Target::Pipe(Box::new(log_file))
         }
-        "stderr" => (),
-        _ => return,
+        "stderr" => Target::Stderr,
+        _ => panic!("Invalid log output specified"),
     };
+
+    let mut builder = env_logger::Builder::from_default_env();
+    builder.filter_level(log_level);
+    builder.target(log_output);
+    builder.filter_module("mio", log::LevelFilter::Info);
+    builder.parse_filters(&log_filters);
 
     builder.init();
 }
@@ -95,7 +101,7 @@ fn init_logging(log_output: String, log_level: String) {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    init_logging(cli.log_output, cli.log_level);
+    init_logging(cli.log_output, cli.log_level, cli.log_filters);
 
     match cli.command {
         Command::Serve { host_mode } => {
