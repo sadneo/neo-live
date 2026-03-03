@@ -3,19 +3,37 @@ use tokio::sync::mpsc::Sender;
 
 use log::{error, trace};
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-pub struct TextUpdate {
-    text: String,
+#[repr(u8)]
+#[derive(Serialize_repr, Deserialize_repr, Debug, PartialEq, Copy, Clone)]
+pub enum MessageKind {
+    InitialSync = 1,
+    Update = 2,
 }
 
-impl TextUpdate {
-    pub fn new(text: String) -> Self {
-        TextUpdate { text }
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct SyncMessage {
+    pub kind: MessageKind,
+    pub buffer: String,
+    pub payload: Vec<u8>,
+}
+
+impl SyncMessage {
+    pub fn new(kind: MessageKind, buffer: String, payload: Vec<u8>) -> Self {
+        Self {
+            kind,
+            buffer,
+            payload,
+        }
     }
 
-    pub fn text(&self) -> &String {
-        &self.text
+    pub fn is_initial_sync(&self) -> bool {
+        self.kind == MessageKind::InitialSync
+    }
+
+    pub fn is_update(&self) -> bool {
+        self.kind == MessageKind::Update
     }
 }
 
@@ -28,6 +46,15 @@ pub struct PluginUpdate {
 }
 
 impl PluginUpdate {
+    pub fn new(cursor_row: u32, cursor_col: u32, buffer: String, text: String) -> Self {
+        PluginUpdate {
+            cursor_row,
+            cursor_col,
+            buffer,
+            text,
+        }
+    }
+
     pub fn from_text(text: String) -> Self {
         PluginUpdate {
             cursor_row: 0,
@@ -35,6 +62,18 @@ impl PluginUpdate {
             buffer: "".to_owned(),
             text,
         }
+    }
+
+    pub fn cursor_row(&self) -> u32 {
+        self.cursor_row
+    }
+
+    pub fn cursor_col(&self) -> u32 {
+        self.cursor_col
+    }
+
+    pub fn buffer(&self) -> &String {
+        &self.buffer
     }
 
     pub fn text(&self) -> &String {

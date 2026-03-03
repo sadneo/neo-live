@@ -8,7 +8,10 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::RwLock;
 
-use crate::protocol::{self, FrameReader, TextUpdate};
+use yrs::updates::decoder::Decode;
+use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
+
+use crate::protocol::{self, FrameReader, MessageKind, SyncMessage};
 
 const CHANNEL_SIZE: usize = 5;
 
@@ -70,7 +73,6 @@ impl ClientPool {
                     clients.swap_remove(i);
                 }
             }
-            // clients[i].flush().await.unwrap();
         }
         trace!("Broadcast done");
 
@@ -78,9 +80,32 @@ impl ClientPool {
             client.flush().await.unwrap();
         }
     }
+
+    async fn send_to(&self, data: &[u8], addr: &SocketAddrV4) {
+        let mut clients = self.clients.write().await;
+
+        for client in &mut *clients {
+            if let Ok(SocketAddr::V4(client_addr)) = client.peer_addr() {
+                if &client_addr == addr {
+                    client.write_all(data).await.unwrap();
+                    client.flush().await.unwrap();
+                    break;
+                }
+            }
+        }
+    }
 }
 
-async fn run_listener(addr: SocketAddrV4, pool: ClientPool, tx: Sender<IncomingMessage>) {
+struct ServerState {
+    doc: Doc,
+    pool: ClientPool,
+}
+
+async fn run_listener(
+    addr: SocketAddrV4,
+    tx: Sender<IncomingMessage>,
+    state: Arc<RwLock<ServerState>>,
+) {
     let listener = TcpListener::bind(addr)
         .await
         .expect("Failed to bind listener");
@@ -92,8 +117,11 @@ async fn run_listener(addr: SocketAddrV4, pool: ClientPool, tx: Sender<IncomingM
                 info!("{} connected to server", address);
                 let (read_half, write_half) = stream.into_split();
 
-                // add the stream to the pool for broadcasting
-                pool.add(write_half, &address).await;
+                // add stream to the pool for broadcasting
+                {
+                    let state = state.read().await;
+                    state.pool.add(write_half, &address).await;
+                }
 
                 // when the stream sends messages, add "from" address so when it gets broadcasted
                 // it doesn't get sent back to the same guy
@@ -120,6 +148,58 @@ async fn run_listener(addr: SocketAddrV4, pool: ClientPool, tx: Sender<IncomingM
     }
 }
 
+async fn handle_initial_sync(
+    state: &Arc<RwLock<ServerState>>,
+    from: &SocketAddrV4,
+    msg: SyncMessage,
+) {
+    let buffer_name = msg.buffer.clone();
+
+    let updates = {
+        let state_guard = state.read().await;
+        let _text = state_guard.doc.get_or_insert_text(buffer_name.as_str());
+
+        if msg.payload.is_empty() {
+            let sv = StateVector::default();
+            state_guard.doc.transact().encode_diff_v1(&sv)
+        } else if let Ok(sv) = StateVector::decode_v1(&msg.payload) {
+            state_guard.doc.transact().encode_diff_v1(&sv)
+        } else {
+            Vec::new()
+        }
+    };
+
+    let sync_response = SyncMessage::new(MessageKind::Update, buffer_name, updates);
+    let framed = protocol::encode_frame(&sync_response).unwrap();
+
+    let state = state.read().await;
+    state.pool.send_to(&framed, from).await;
+    info!("Sent sync response to {}", from);
+}
+
+async fn handle_update(state: &Arc<RwLock<ServerState>>, from: &SocketAddrV4, msg: SyncMessage) {
+    let buffer_name = msg.buffer.clone();
+    let update_data = msg.payload;
+
+    if !update_data.is_empty() {
+        let update = Update::decode_v1(&update_data).unwrap();
+        let state_guard = state.read().await;
+        let mut txn = state_guard.doc.transact_mut();
+        let _ = txn.apply_update(update);
+    }
+
+    let framed = protocol::encode_frame(&SyncMessage::new(
+        MessageKind::Update,
+        buffer_name.clone(),
+        update_data,
+    ))
+    .unwrap();
+
+    let state = state.read().await;
+    state.pool.broadcast(&framed, from).await;
+    info!("Broadcasted update for buffer {}", buffer_name);
+}
+
 // server acts as a relay to send buffer contents
 // later will relay CRDT operations instead
 // later check whether the messages are valid so it doesn't relay junk
@@ -127,32 +207,37 @@ async fn run_listener(addr: SocketAddrV4, pool: ClientPool, tx: Sender<IncomingM
 // uses TcpListener to add streams to ClientPool
 // both reads and writes to streams
 pub async fn serve(addr: SocketAddrV4) {
+    let doc = Doc::new();
     let pool = ClientPool::new();
+
+    let state = Arc::new(RwLock::new(ServerState { doc, pool }));
+    let state_ref = state.clone();
 
     // listen for connections
     // also set up input reading from clients here
-    let pool_ref = pool.clone();
     let (tx, mut rx) = mpsc::channel(CHANNEL_SIZE);
 
     tokio::task::spawn(async move {
         debug!("starting listener with address {}", addr);
-        run_listener(addr, pool_ref, tx).await;
+        run_listener(addr, tx, state_ref).await;
     });
     trace!("created listeners");
 
-    while let Some(msg) = rx.recv().await {
-        let Ok(message) = rmp_serde::from_slice::<TextUpdate>(&msg.content) else {
+    while let Some(incoming) = rx.recv().await {
+        let Ok(msg) = rmp_serde::from_slice::<SyncMessage>(&incoming.content) else {
             error!("Failed to deserialize message");
             continue;
         };
-        info!("received message: {}", message.text());
 
-        let Some(framed_msg) = protocol::encode_frame(&message) else {
-            error!("Failed to encode message");
-            continue;
-        };
-
-        pool.broadcast(&framed_msg, &msg.from).await;
+        if msg.kind == MessageKind::InitialSync {
+            info!("Received initial sync request for buffer: {}", msg.buffer);
+            handle_initial_sync(&state, &incoming.from, msg).await;
+        } else if msg.kind == MessageKind::Update {
+            info!("Received update for buffer: {}", msg.buffer);
+            handle_update(&state, &incoming.from, msg).await;
+        } else {
+            error!("Unknown message kind: {:?}", msg.kind);
+        }
     }
     error!("done with err {:?}", rx.recv().await);
 }
