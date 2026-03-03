@@ -25,7 +25,7 @@ struct Cli {
     log_level: String,
 
     /// Filter directives in the form of the RUST_LOG environment variable
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     log_filters: String,
 }
 

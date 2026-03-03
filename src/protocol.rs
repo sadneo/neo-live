@@ -45,6 +45,21 @@ pub struct PluginUpdate {
     text: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct PluginOpen {
+    buffers: Vec<String>,
+}
+
+impl PluginOpen {
+    pub fn new(buffers: Vec<String>) -> Self {
+        Self { buffers }
+    }
+
+    pub fn buffers(&self) -> &Vec<String> {
+        &self.buffers
+    }
+}
+
 impl PluginUpdate {
     pub fn new(cursor_row: u32, cursor_col: u32, buffer: String, text: String) -> Self {
         PluginUpdate {
@@ -173,6 +188,12 @@ mod tests {
         assert_eq!(update.cursor_col(), 22);
         assert_eq!(update.buffer(), "src/lib.rs");
         assert_eq!(update.text(), "hello");
+    }
+
+    #[test]
+    fn plugin_open_accessors_work() {
+        let open = PluginOpen::new(vec!["src/main.rs".to_owned(), "src/lib.rs".to_owned()]);
+        assert_eq!(open.buffers(), &vec!["src/main.rs".to_owned(), "src/lib.rs".to_owned()]);
     }
 
     #[test]
