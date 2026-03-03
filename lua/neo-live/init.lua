@@ -9,10 +9,20 @@ M.config = {
 
 M._client_job = nil
 M._is_applying_remote = false
+M._managed_buffers = {}
+M._known_buffers = {}
+M._sent_open = false
+M._pending_updates = {}
+M._prompting_buffers = {}
 
 -- Get all lines from the current buffer (0)
 local function get_buffer_text()
     local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+    return table.concat(lines, "\n")
+end
+
+local function get_buffer_text_for(bufnr)
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
     return table.concat(lines, "\n")
 end
 
@@ -44,6 +54,69 @@ local function encode_length(len)
     )
 end
 
+local function normalize_buffer_name(name)
+    if name == "" then return "" end
+    return vim.fn.fnamemodify(name, ":.")
+end
+
+local function send_plugin_open(buffers)
+    if not M._client_job then return end
+    local payload = vim.mpack.encode({ buffers = buffers })
+    local length = encode_length(#payload)
+    M._client_job:write(length .. payload)
+end
+
+local function collect_open_buffers()
+    local buffers = {}
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        local name = vim.api.nvim_buf_get_name(buf)
+        local normalized = normalize_buffer_name(name)
+        if normalized ~= "" then
+            if not M._known_buffers[normalized] then
+                M._known_buffers[normalized] = true
+                table.insert(buffers, normalized)
+            end
+        end
+    end
+    return buffers
+end
+
+local function attach_buffer(bufnr)
+    vim.api.nvim_buf_attach(bufnr, false, {
+        on_lines = function()
+            if M._is_applying_remote or not M._client_job or not M._sent_open then return end
+
+            local buffer = vim.api.nvim_buf_get_name(bufnr)
+            local normalized = normalize_buffer_name(buffer)
+            if normalized == "" then
+                log.log("Skipping PluginUpdate: empty buffer name", "WARN")
+                return
+            end
+
+            local cursor = { 0, 0 }
+            if bufnr == vim.api.nvim_get_current_buf() then
+                cursor = vim.api.nvim_win_get_cursor(0)
+            end
+
+            local text = get_buffer_text_for(bufnr)
+            log.log(
+                string.format("Sending PluginUpdate buffer=%s len=%d", normalized, #text),
+                "TRACE"
+            )
+
+            local payload = vim.mpack.encode({
+                cursor_row = cursor[1],
+                cursor_col = cursor[2],
+                buffer = normalized,
+                text = text,
+            })
+
+            local length = encode_length(#payload)
+            M._client_job:write(length .. payload)
+        end
+    })
+end
+
 function M.setup(opts)
     M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 end
@@ -55,28 +128,6 @@ function M.connect()
     if bin == "" then return print("Binary not found!") end
 
     log.log("Connecting to " .. M.config.address .. ":" .. M.config.port)
-
-    -- listen for buffer changes
-    vim.api.nvim_buf_attach(0, false, {
-        on_lines = function()
-            if M._is_applying_remote or not M._client_job then return end
-
-            local text = get_buffer_text()
-            local cursor = vim.api.nvim_win_get_cursor(0)
-            local buffer = vim.api.nvim_buf_get_name(0)
-            log.log("Sending buffer text " .. text, "TRACE")
-
-            local payload = vim.mpack.encode({
-                cursor_row = cursor[1],
-                cursor_col = cursor[2],
-                buffer = vim.fn.fnamemodify(buffer, ":."),
-                text = text,
-            })
-
-            local length = encode_length(#payload)
-            M._client_job:write(length .. payload)
-        end
-    })
 
     local buffer = ""
     local function onClientUpdate(err, data)
@@ -102,13 +153,42 @@ function M.connect()
             local ok, decoded = pcall(vim.mpack.decode, raw_payload)
 
             log.log(string.format("decoded: %s, ok: %s", vim.inspect(decoded), tostring(ok)), "TRACE")
-            if ok and decoded and type(decoded) == "table" and decoded.text then
-                local lines = vim.split(decoded.text, "\n")
+            if ok and decoded and type(decoded) == "table" and decoded.text and decoded.buffer then
+                local bufname = decoded.buffer
+                local lines = vim.split(decoded.text, "\n", true)
                 vim.schedule(function()
+                    if decoded.text == "" and not M._managed_buffers[bufname] then
+                        return
+                    end
+                    if not M._managed_buffers[bufname] then
+                        M._pending_updates[bufname] = lines
+                        if M._prompting_buffers[bufname] then
+                            return
+                        end
+
+                        M._prompting_buffers[bufname] = true
+                        local prompt = string.format(
+                            "neo-live has remote contents for %s. Overwrite buffer?",
+                            bufname
+                        )
+                        local choice = vim.fn.confirm(prompt, "&Yes\n&No")
+                        M._prompting_buffers[bufname] = nil
+
+                        if choice ~= 1 then
+                            M._pending_updates[bufname] = nil
+                            return
+                        end
+
+                        M._managed_buffers[bufname] = true
+                        lines = M._pending_updates[bufname] or lines
+                        M._pending_updates[bufname] = nil
+                    end
+
                     -- WARN: edits that happen between here will fall through the cracks,
                     -- might need a better solution
                     M._is_applying_remote = true
-                    vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+                    local bufnr = vim.fn.bufnr(bufname, true)
+                    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
                     M._is_applying_remote = false
                 end)
             else
@@ -130,8 +210,33 @@ function M.connect()
         function(obj)
             log.log("Client exited with code " .. obj.code)
             M._client_job = nil
+            M._sent_open = false
         end
     )
+
+    local open_buffers = collect_open_buffers()
+    send_plugin_open(open_buffers)
+    M._sent_open = true
+
+    -- listen for buffer changes
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        local name = vim.api.nvim_buf_get_name(buf)
+        if normalize_buffer_name(name) ~= "" then
+            attach_buffer(buf)
+        end
+    end
+
+    vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile" }, {
+        callback = function(args)
+            if not M._client_job or not M._sent_open then return end
+            local name = vim.api.nvim_buf_get_name(args.buf)
+            local normalized = normalize_buffer_name(name)
+            if normalized == "" or M._known_buffers[normalized] then return end
+            M._known_buffers[normalized] = true
+            send_plugin_open({ normalized })
+            attach_buffer(args.buf)
+        end
+    })
 end
 
 function M.stop()
@@ -139,6 +244,7 @@ function M.stop()
         M._client_job:kill(9)
         M._client_job = nil
     end
+    M._sent_open = false
 end
 
 return M
