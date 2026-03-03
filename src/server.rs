@@ -33,8 +33,7 @@ impl ClientPool {
         }
     }
 
-    async fn add(&self, stream: OwnedWriteHalf, addr: &SocketAddrV4) {
-        info!("Client added at {}", addr);
+    async fn add(&self, stream: OwnedWriteHalf) {
         self.clients.write().await.push(stream);
     }
 
@@ -44,7 +43,6 @@ impl ClientPool {
 
         // retain only clients that successfully accept the write
         let mut i = 0;
-        trace!("Broadcasting update");
         while i < clients.len() {
             let client = &clients[i];
             let addr_string = client
@@ -54,7 +52,6 @@ impl ClientPool {
 
             trace!("Handling client {}", addr_string);
             if let Ok(SocketAddr::V4(addr)) = client.peer_addr() {
-                trace!("Judging whether to skip addr {}, ignore {}", addr, ignore);
                 if &addr == ignore {
                     trace!("Skipping {}", addr);
                     i += 1;
@@ -74,7 +71,6 @@ impl ClientPool {
                 }
             }
         }
-        trace!("Broadcast done");
 
         for client in &mut *clients {
             client.flush().await.unwrap();
@@ -120,15 +116,14 @@ async fn run_listener(
                 // add stream to the pool for broadcasting
                 {
                     let state = state.read().await;
-                    state.pool.add(write_half, &address).await;
+                    state.pool.add(write_half).await;
                 }
 
                 // when the stream sends messages, add "from" address so when it gets broadcasted
                 // it doesn't get sent back to the same guy
                 let mut reader = FrameReader::new(read_half);
                 tokio::spawn(async move {
-                    while let Some(msg) = reader.next_frame().await {
-                        trace!("Transmitting message");
+                    while let Some(msg) = reader.read_one().await {
                         let msg = IncomingMessage {
                             from: address,
                             content: msg,
@@ -197,7 +192,7 @@ async fn handle_update(state: &Arc<RwLock<ServerState>>, from: &SocketAddrV4, ms
 
     let state = state.read().await;
     state.pool.broadcast(&framed, from).await;
-    info!("Broadcasted update for buffer {}", buffer_name);
+    trace!("Broadcasted update for buffer {}", buffer_name);
 }
 
 // server acts as a relay to send buffer contents
@@ -218,10 +213,9 @@ pub async fn serve(addr: SocketAddrV4) {
     let (tx, mut rx) = mpsc::channel(CHANNEL_SIZE);
 
     tokio::task::spawn(async move {
-        debug!("starting listener with address {}", addr);
+        debug!("Starting listener with address {}", addr);
         run_listener(addr, tx, state_ref).await;
     });
-    trace!("created listeners");
 
     while let Some(incoming) = rx.recv().await {
         let Ok(msg) = rmp_serde::from_slice::<SyncMessage>(&incoming.content) else {
@@ -230,10 +224,10 @@ pub async fn serve(addr: SocketAddrV4) {
         };
 
         if msg.kind == MessageKind::InitialSync {
-            info!("Received initial sync request for buffer: {}", msg.buffer);
+            debug!("Received initial sync request for buffer: {}", msg.buffer);
             handle_initial_sync(&state, &incoming.from, msg).await;
         } else if msg.kind == MessageKind::Update {
-            info!("Received update for buffer: {}", msg.buffer);
+            debug!("Received update for buffer: {}", msg.buffer);
             handle_update(&state, &incoming.from, msg).await;
         } else {
             error!("Unknown message kind: {:?}", msg.kind);

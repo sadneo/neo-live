@@ -109,20 +109,10 @@ impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
     }
     pub async fn read_loop(mut self, sender: Sender<Vec<u8>>) {
         trace!("FrameReader read loop started");
-        let mut len_buf = [0u8; 4];
         loop {
-            if self.reader.read_exact(&mut len_buf).await.is_err() {
-                error!("Connection closed");
+            let Some(buf) = self.read_one().await else {
                 break;
-            }
-            let len = u32::from_be_bytes(len_buf) as usize;
-            trace!("FrameReader unpacked {} bytes", len);
-
-            let mut buf = vec![0u8; len];
-            if self.reader.read_exact(&mut buf).await.is_err() {
-                error!("Connection closed");
-                break;
-            }
+            };
             if sender.send(buf).await.is_err() {
                 error!("Channel closed");
                 break;
@@ -130,15 +120,13 @@ impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
         }
         error!("Read loop broke")
     }
-    pub async fn next_frame(&mut self) -> Option<Vec<u8>> {
+    pub async fn read_one(&mut self) -> Option<Vec<u8>> {
         let mut len_buf = [0u8; 4];
-        trace!("stream waiting on reading data...");
         if self.reader.read_exact(&mut len_buf).await.is_err() {
             error!("Connection closed");
             return None;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
-        trace!("FrameReader unpacked {} bytes", len);
 
         let mut buf = vec![0u8; len];
         if self.reader.read_exact(&mut buf).await.is_err() {
@@ -204,7 +192,7 @@ mod tests {
         let payload = vec![9, 8, 7, 6, 5];
         write_frame(&mut writer, &payload).await;
 
-        let read = frame_reader.next_frame().await.expect("frame");
+        let read = frame_reader.read_one().await.expect("frame");
         assert_eq!(read, payload);
     }
 
@@ -218,8 +206,8 @@ mod tests {
         write_frame(&mut writer, &payload_a).await;
         write_frame(&mut writer, &payload_b).await;
 
-        let read_a = frame_reader.next_frame().await.expect("frame a");
-        let read_b = frame_reader.next_frame().await.expect("frame b");
+        let read_a = frame_reader.read_one().await.expect("frame a");
+        let read_b = frame_reader.read_one().await.expect("frame b");
 
         assert_eq!(read_a, payload_a);
         assert_eq!(read_b, payload_b);
