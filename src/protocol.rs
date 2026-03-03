@@ -149,3 +149,79 @@ impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
         Some(buf)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncWriteExt, DuplexStream};
+
+    fn decode_len_prefix(buf: &[u8]) -> u32 {
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&buf[..4]);
+        u32::from_be_bytes(len_bytes)
+    }
+
+    async fn write_frame(stream: &mut DuplexStream, payload: &[u8]) {
+        let len = (payload.len() as u32).to_be_bytes();
+        stream.write_all(&len).await.unwrap();
+        stream.write_all(payload).await.unwrap();
+    }
+
+    #[test]
+    fn sync_message_kind_helpers_work() {
+        let msg = SyncMessage::new(MessageKind::InitialSync, "main.rs".to_owned(), Vec::new());
+        assert!(msg.is_initial_sync());
+        assert!(!msg.is_update());
+
+        let msg = SyncMessage::new(MessageKind::Update, "main.rs".to_owned(), Vec::new());
+        assert!(msg.is_update());
+        assert!(!msg.is_initial_sync());
+    }
+
+    #[test]
+    fn plugin_update_accessors_work() {
+        let update = PluginUpdate::new(10, 22, "src/lib.rs".to_owned(), "hello".to_owned());
+        assert_eq!(update.cursor_row(), 10);
+        assert_eq!(update.cursor_col(), 22);
+        assert_eq!(update.buffer(), "src/lib.rs");
+        assert_eq!(update.text(), "hello");
+    }
+
+    #[test]
+    fn encode_frame_prefix_matches_payload_len() {
+        let msg = SyncMessage::new(MessageKind::Update, "buffer".to_owned(), vec![1, 2, 3]);
+        let framed = encode_frame(&msg).expect("frame");
+        let len = decode_len_prefix(&framed) as usize;
+        assert_eq!(len, framed.len() - 4);
+        assert!(len > 0);
+    }
+
+    #[tokio::test]
+    async fn frame_reader_reads_single_frame() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut frame_reader = FrameReader::new(reader);
+
+        let payload = vec![9, 8, 7, 6, 5];
+        write_frame(&mut writer, &payload).await;
+
+        let read = frame_reader.next_frame().await.expect("frame");
+        assert_eq!(read, payload);
+    }
+
+    #[tokio::test]
+    async fn frame_reader_reads_multiple_frames() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+        let mut frame_reader = FrameReader::new(reader);
+
+        let payload_a = vec![1, 2, 3];
+        let payload_b = vec![4, 5, 6, 7];
+        write_frame(&mut writer, &payload_a).await;
+        write_frame(&mut writer, &payload_b).await;
+
+        let read_a = frame_reader.next_frame().await.expect("frame a");
+        let read_b = frame_reader.next_frame().await.expect("frame b");
+
+        assert_eq!(read_a, payload_a);
+        assert_eq!(read_b, payload_b);
+    }
+}
