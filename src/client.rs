@@ -12,7 +12,7 @@ use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
 
-use crate::protocol::{self, FrameReader, MessageKind, PluginUpdate, SyncMessage};
+use crate::protocol::{self, FrameReader, MessageKind, PluginOpen, PluginUpdate, SyncMessage};
 
 const CHANNEL_SIZE: usize = 5;
 
@@ -246,6 +246,15 @@ where
         trace!("Sent update to server");
         Ok(())
     }
+
+    async fn handle_open_buffers(&self, buffers: Vec<String>) {
+        for buffer in buffers {
+            let context = self.clone();
+            tokio::spawn(async move {
+                let _ = context.ensure_buffer_synced(&buffer).await;
+            });
+        }
+    }
 }
 
 // client takes the updated contents from the buffer and sends them to relay
@@ -281,6 +290,19 @@ pub async fn run_client<R, W, RH, WH>(
     // define reader for stream, stdin, stdout
     let context = ClientContext::new(write_half);
 
+    let mut stdin_reader = FrameReader::new(input);
+    let Some(initial_msg_bytes) = stdin_reader.read_one().await else {
+        error!("Stdin closed before PluginOpen");
+        return;
+    };
+    let initial_open: PluginOpen = match rmp_serde::from_slice(&initial_msg_bytes) {
+        Ok(open) => open,
+        Err(e) => {
+            error!("Failed to deserialize initial PluginOpen: {}", e);
+            return;
+        }
+    };
+
     // read from stream for broadcasted updates
     let (stream_tx, mut stream_rx) = mpsc::channel(CHANNEL_SIZE);
     let stream_reader = FrameReader::new(read_half);
@@ -289,7 +311,6 @@ pub async fn run_client<R, W, RH, WH>(
 
     // write stdin updates to stream
     let (stdin_tx, mut stdin_rx) = mpsc::channel(CHANNEL_SIZE);
-    let stdin_reader = FrameReader::new(input);
     task::spawn(async move { stdin_reader.read_loop(stdin_tx).await });
     trace!("Spawned plugin stream read loop");
 
@@ -319,6 +340,12 @@ pub async fn run_client<R, W, RH, WH>(
     let plugin_context = context.clone();
     let plugin_task = task::spawn(async move {
         while let Some(msg_bytes) = stdin_rx.recv().await {
+            if let Ok(plugin_open) = rmp_serde::from_slice::<PluginOpen>(&msg_bytes) {
+                let buffers = plugin_open.buffers().clone();
+                plugin_context.handle_open_buffers(buffers).await;
+                continue;
+            }
+
             let plugin_update: PluginUpdate = match rmp_serde::from_slice(&msg_bytes) {
                 Ok(update) => update,
                 Err(e) => {
@@ -333,6 +360,10 @@ pub async fn run_client<R, W, RH, WH>(
         }
         error!("Stdin closed");
     });
+
+    context
+        .handle_open_buffers(initial_open.buffers().clone())
+        .await;
 
     let _ = tokio::join!(server_task, plugin_task);
 }
